@@ -1,0 +1,212 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hospital Resource Prediction Dashboard</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root{--bg:#f3f7fd;--card:#fff;--tx:#0f2747;--mu:#5b6f8a;--bd:#d9e5f4;--pri:#1d4ed8;--sky:#0ea5e9;--red:#dc2626;--amb:#d97706;--grn:#059669;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0a1322;--card:#111d33;--tx:#e6eefb;--mu:#93a4bf;--bd:#1f2f4d;--pri:#60a5fa;--sky:#38bdf8}}
+:root[data-theme="dark"]{--bg:#0a1322;--card:#111d33;--tx:#e6eefb;--mu:#93a4bf;--bd:#1f2f4d;--pri:#60a5fa;--sky:#38bdf8}
+html{scroll-padding-top:env(safe-area-inset-top,0px);color-scheme:light dark}
+body{background:var(--bg);color:var(--tx);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px}
+.mu{color:var(--mu)}.hd{background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff}
+.tab{padding:8px 14px;border-radius:999px;font-size:14px;white-space:nowrap;color:#dbeafe}.tab.on{background:#fff;color:#1e3a8a;font-weight:600}
+.btn{background:#1d4ed8;color:#fff;border-radius:10px;padding:8px 14px;font-size:14px;font-weight:600}.btn.alt{background:transparent;color:var(--pri);border:1px solid var(--bd)}
+select,input[type=number]{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:6px 8px;font-size:14px}
+table{width:100%;font-size:14px;border-collapse:collapse}th{color:var(--mu);font-weight:500;text-align:right;padding:8px 6px;border-bottom:1px solid var(--bd)}td{text-align:right;padding:8px 6px;border-bottom:1px solid var(--bd)}th:first-child,td:first-child{text-align:left}
+.sc{overflow-x:auto}
+</style></head><body><div id="root"></div>
+<script>
+const {useState,useMemo}=React,html=htm.bind(React.createElement);
+const sum=a=>a.reduce((x,y)=>x+y,0),avg=a=>a.length?sum(a)/a.length:0;
+const dowOf=d=>new Date(d+'T00:00:00Z').getUTCDay();
+const addDays=(d,n)=>{const t=new Date(d+'T00:00:00Z');t.setUTCDate(t.getUTCDate()+n);return t.toISOString().slice(0,10)};
+const iso=s=>{s=String(s||'');let m=s.match(/^(\d{4})-(\d\d)-(\d\d)/);if(m)return m[1]+'-'+m[2]+'-'+m[3];m=s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/);return m?m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0'):null};
+
+/* ---------- Demo data (synthetic, seeded, no real patients) ---------- */
+function sampleData(){
+ let s=42;const rnd=()=>(s=(s*1664525+1013904223)%4294967296)/4294967296,g=()=>Math.sqrt(-2*Math.log(rnd()+1e-9))*Math.cos(2*Math.PI*rnd());
+ const D=[['Emergency',40,22,1.6,5,11],['ICU',20,4,3.8,3,10],['General Medicine',80,14,4.5,6,14],['Surgery',50,9,4,5,10],['Pediatrics',30,6,3.5,3,6],['Maternity',24,5,3,3,5]];
+ const W=[.82,1.12,1.08,1.03,1,.98,.97],daily=[];
+ D.forEach(([dept,beds,base,los,dc,nu])=>{let occ=base*los*.85;
+  for(let i=0;i<365;i++){const date=addDays('2025-10-14',i),mean=base*W[dowOf(date)]*(1+.1*Math.cos(2*Math.PI*(i-90)/365))*(1+.0003*i);
+   const adm=Math.max(0,Math.round(mean+Math.sqrt(mean)*g()));occ=Math.min(beds*1.02,occ*(1-1/los)+adm);
+   daily.push({date,dept,adm,dis:Math.round(occ/los),occ:Math.round(occ),beds,docs:Math.max(1,Math.round(dc+.5*g())),nurses:Math.max(1,Math.round(nu+.7*g()))})}});
+ return {daily,caps:deriveCaps(daily),source:'demo'}}
+function deriveCaps(daily){const g={};daily.forEach(r=>(g[r.dept]=g[r.dept]||[]).push(r));const c={};
+ for(const d in g){const L=g[d].sort((a,b)=>a.date<b.date?-1:1).slice(-28),m=f=>{const v=L.map(r=>r[f]).filter(x=>x>0);return v.length?Math.round(avg(v)):null};
+  c[d]={beds:Math.max(...L.map(r=>r.beds||0))||null,docs:m('docs'),nurses:m('nurses')}}return c}
+
+/* ---------- Forecast engine: day-of-week seasonality + 8-week trend + Little's-law bed flow ---------- */
+function fcAdm(y,dates,H){
+ const W=Math.min(56,y.length),s=y.length-W,ys=y.slice(s),ds=dates.slice(s),m=avg(ys)||1,f=Array(7).fill(0),c=Array(7).fill(0);
+ ys.forEach((v,i)=>{const k=dowOf(ds[i]);f[k]+=v;c[k]++});const fac=f.map((v,k)=>c[k]?v/c[k]/m:1);
+ const z=ys.map((v,i)=>v/fac[dowOf(ds[i])]),zm=avg(z),xm=(W-1)/2;let sxy=0,sxx=0;z.forEach((v,i)=>{sxy+=(i-xm)*(v-zm);sxx+=(i-xm)**2});
+ let b=sxx?sxy/sxx:0;const cap=.01*zm;b=Math.max(-cap,Math.min(cap,b));const a=zm-b*xm;
+ const sd=Math.sqrt(avg(ys.map((v,i)=>(v-(a+b*i)*fac[dowOf(ds[i])])**2))),last=dates[dates.length-1],fd=[],p=[];
+ for(let h=1;h<=H;h++){const d=addDays(last,h);fd.push(d);p.push(Math.max(0,(a+b*(W-1+h))*fac[dowOf(d)]))}
+ return {p,fd,sd}}
+function run(data,P){
+ const alld=[...new Set(data.daily.map(r=>r.date))].sort(),by={};data.daily.forEach(r=>(by[r.dept]=by[r.dept]||{})[r.date]=r);
+ const depts=[];
+ for(const name in by){let prev=0;const R=alld.map(d=>by[name][d]||{date:d,adm:0,dis:0,occ:prev});R.forEach(r=>prev=r.occ);
+  const adm=R.map(r=>r.adm),occ=R.map(r=>r.occ),n=R.length,F=fcAdm(adm,alld,30),alos=Math.max(1,avg(occ.slice(-28))/Math.max(.1,avg(adm.slice(-28)))),phi=1-1/alos;
+  let pv=occ[n-1];const fo=F.p.map(p=>pv=pv*phi+p),bw=1.28*F.sd*Math.sqrt(alos/2),k=data.caps[name]||{};
+  const beds=k.beds||Math.ceil(Math.max(...occ)*1.15),peak=Math.max(...fo),reqBeds=Math.ceil(peak/P.target),docReq=Math.ceil(peak/P.pd),nurReq=Math.ceil(peak/P.pn);
+  const bt=n>=90?fcAdm(adm.slice(0,-30),alld.slice(0,-30),30).p:null;
+  depts.push({name,dates:alld,fd:F.fd,adm,occ,fa:F.p,fo,ahi:F.p.map(v=>v+1.28*F.sd),alo:F.p.map(v=>Math.max(0,v-1.28*F.sd)),hi:fo.map(v=>v+bw),lo:fo.map(v=>Math.max(0,v-bw)),alos,beds,reqBeds,shortBeds:Math.max(0,reqBeds-beds),
+   docAv:k.docs??null,nurAv:k.nurses??null,docReq,nurReq,docShort:k.docs==null?0:Math.max(0,docReq-k.docs),nurShort:k.nurses==null?0:Math.max(0,nurReq-k.nurses),bt})}
+ let mape=null;const bd=depts.filter(d=>d.bt);if(bd.length){const act=[],pr=[];for(let i=0;i<30;i++){act.push(sum(bd.map(d=>d.adm[d.adm.length-30+i])));pr.push(sum(bd.map(d=>d.bt[i])))}mape=avg(act.map((a,i)=>a?Math.abs(pr[i]-a)/a:0))*100}
+ return {depts,mape}}
+const ARR=['adm','occ','fa','fo','hi','lo','ahi','alo'],SC=['beds','reqBeds','shortBeds','docReq','nurReq','docShort','nurShort'];
+function agg(L){if(L.length<2)return L[0];const o={name:'All departments',dates:L[0].dates,fd:L[0].fd};
+ ARR.forEach(k=>o[k]=L[0][k].map((_,i)=>sum(L.map(d=>d[k][i]))));SC.forEach(k=>o[k]=sum(L.map(d=>d[k])));
+ ['docAv','nurAv'].forEach(k=>o[k]=L.some(d=>d[k]==null)?null:sum(L.map(d=>d[k])));return o}
+
+/* ---------- Upload parsing (runs in the browser; nothing leaves the device) ---------- */
+function parseCSV(t){const R=[];let r=[],c='',q=false;for(let i=0;i<t.length;i++){const ch=t[i];if(q){if(ch=='"'){if(t[i+1]=='"'){c+='"';i++}else q=false}else c+=ch}else if(ch=='"')q=true;else if(ch==','){r.push(c);c=''}else if(ch=='\n'||ch=='\r'){if(ch=='\r'&&t[i+1]=='\n')i++;r.push(c);c='';R.push(r);r=[]}else c+=ch}
+ if(c||r.length){r.push(c);R.push(r)}const h=R.shift().map(x=>x.trim().toLowerCase().replace(/[\s-]+/g,'_'));return R.filter(a=>a.length>1).map(a=>Object.fromEntries(h.map((k,i)=>[k,(a[i]||'').trim()])))}
+async function readFile(f){if(/\.csv$/i.test(f.name))return parseCSV(await f.text());
+ const wb=XLSX.read(await f.arrayBuffer(),{type:'array'}),ws=wb.Sheets[wb.SheetNames[0]];
+ return XLSX.utils.sheet_to_json(ws,{raw:false,defval:'',dateNF:'yyyy-mm-dd'}).map(o=>Object.fromEntries(Object.entries(o).map(([k,v])=>[k.trim().toLowerCase().replace(/[\s-]+/g,'_'),String(v).trim()])))}
+function ingest(rows){
+ if(!rows.length)throw 'The file has no data rows.';const k=Object.keys(rows[0]),has=x=>k.includes(x),num=v=>v===''||v==null||isNaN(+v)?null:+v;
+ const ignored=k.filter(c=>/name|mrn|phone|address|dob|birth|aadhaar|ssn|email|patient_id|^id$/.test(c));let daily=[];
+ if(has('admission_date')&&has('department')){
+  const P=rows.map(r=>({a:iso(r.admission_date),d:iso(r.discharge_date),p:r.department||'Unassigned'})).filter(r=>r.a&&(!r.d||r.d>=r.a));
+  if(!P.length)throw 'No valid admission_date values found (use YYYY-MM-DD or DD/MM/YYYY).';
+  const lo=P.reduce((m,r)=>r.a<m?r.a:m,'9'),hi=P.reduce((m,r)=>(r.d||r.a)>m?(r.d||r.a):m,'0'),days=[];for(let d=lo;d<=hi&&days.length<4000;d=addDays(d,1))days.push(d);
+  const ix=Object.fromEntries(days.map((d,i)=>[d,i])),G={};
+  P.forEach(r=>{const o=G[r.p]=G[r.p]||{adm:Array(days.length).fill(0),dis:Array(days.length).fill(0),dv:Array(days.length+1).fill(0)};o.adm[ix[r.a]]++;o.dv[ix[r.a]]++;if(r.d){o.dis[ix[r.d]]++;o.dv[ix[r.d]]--}});
+  for(const p in G){let c=0;days.forEach((d,i)=>{c+=G[p].dv[i];daily.push({date:d,dept:p,adm:G[p].adm[i],dis:G[p].dis[i],occ:c})})}
+ }else if(has('date')&&has('department')&&has('admissions')){
+  if(!has('occupied_beds'))throw 'Daily format needs an occupied_beds column.';
+  daily=rows.map(r=>({date:iso(r.date),dept:r.department,adm:num(r.admissions)||0,dis:num(r.discharges)||0,occ:num(r.occupied_beds)||0,beds:num(r.total_beds),docs:num(r.doctors),nurses:num(r.nurses)})).filter(r=>r.date&&r.dept);
+ }else if(has('department')&&(has('doctors')||has('nurses')||has('total_beds'))){
+  const caps={};rows.forEach(r=>caps[r.department]={beds:num(r.total_beds),docs:num(r.doctors),nurses:num(r.nurses)});return {caps,ignored}}
+ else throw 'Columns not recognised. See the accepted formats below.';
+ if(!daily.length)throw 'No usable rows found.';return {daily,caps:deriveCaps(daily),ignored}}
+
+/* ---------- Insights, downloads ---------- */
+function insights(M,P){const A=[],R=[];
+ M.depts.forEach(d=>{const i9=d.fo.findIndex(v=>v>d.beds*.9),i1=d.fo.findIndex(v=>v>d.beds);
+  if(i1>=0)A.push({s:'critical',t:`${d.name}: occupied beds forecast to exceed capacity (${d.beds}) around ${d.fd[i1]}.`});else if(i9>=0)A.push({s:'warning',t:`${d.name}: occupancy forecast to pass 90% of capacity around ${d.fd[i9]}.`});
+  if(d.shortBeds)R.push(`${d.name}: plan for ${d.shortBeds} additional bed(s) (or faster discharges / diversion) to hold ${Math.round(P.target*100)}% target occupancy at the forecast peak.`);
+  if(d.docShort)A.push({s:'warning',t:`${d.name}: short by ${d.docShort} doctor(s) at forecast peak.`}),R.push(`${d.name}: add ${d.docShort} doctor shift(s) or arrange cover.`);
+  if(d.nurShort)A.push({s:'warning',t:`${d.name}: short by ${d.nurShort} nurse(s) at forecast peak.`}),R.push(`${d.name}: add ${d.nurShort} nurse shift(s) (overtime, float pool or agency).`)});
+ if(!R.length)R.push('No shortages forecast under current assumptions. Keep monitoring weekly.');return {A,R}}
+async function save(name,text,type){
+ try{const d=window.claude&&await window.claude.use('downloads');if(d){await d.save({filename:name,data:new Blob([text],{type})});return}}catch(e){if(e&&e.code==='declined')return}
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click()}
+
+/* ---------- UI pieces ---------- */
+const Badge=(t,c)=>html`<span style=${{background:`color-mix(in srgb,var(--${c}) 15%,transparent)`,color:`var(--${c})`,padding:'2px 8px',borderRadius:99,fontSize:12,fontWeight:600}}>${t}</span>`;
+const Kpi=({l,v,s,c})=>html`<div class="card"><div class="mu text-sm">${l}</div><div class="text-3xl font-bold mt-1" style=${{color:c?`var(--${c})`:'var(--tx)'}}>${v}</div><div class="mu text-xs mt-1">${s}</div></div>`;
+function Chart({dates,series,band,split,h=230,title}){
+ const [hv,setHv]=useState(null),W=700,p={l:40,r:10,t:10,b:22},n=dates.length,all=series.flatMap(s=>s.v).concat(band?band.hi:[]),mx=Math.max(1,...all)*1.08;
+ const X=i=>p.l+i*(W-p.l-p.r)/(n-1),Y=v=>p.t+(1-v/mx)*(h-p.t-p.b),pth=s=>s.v.map((y,i)=>(i?'L':'M')+X(i+s.o).toFixed(1)+' '+Y(y).toFixed(1)).join('');
+ const poly=band&&band.hi.map((v,i)=>X(i+band.o).toFixed(1)+','+Y(v).toFixed(1)).concat(band.lo.map((v,i)=>X(i+band.o)+','+Y(v)).reverse()).join(' ');
+ const mv=e=>{const r=e.currentTarget.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W;setHv(Math.max(0,Math.min(n-1,Math.round((x-p.l)*(n-1)/(W-p.l-p.r)))))};
+ return html`<div><div class="flex justify-between text-sm mb-1"><b>${title}</b><span class="mu text-xs">${hv==null?'Hover for values':dates[hv]+' · '+series.map(s=>{const v=s.v[hv-s.o];return v==null?null:s.name+': '+Math.round(v*10)/10}).filter(Boolean).join(' · ')}</span></div>
+ <svg viewBox=${`0 0 ${W} ${h}`} style=${{width:'100%',height:'auto'}} onMouseMove=${mv} onMouseLeave=${()=>setHv(null)}>
+ ${[0,1,2,3,4].map(k=>html`<g key=${k}><line x1=${p.l} x2=${W-p.r} y1=${Y(mx*k/4)} y2=${Y(mx*k/4)} stroke="var(--bd)"/><text x=${p.l-5} y=${Y(mx*k/4)+4} text-anchor="end" font-size="11" fill="var(--mu)">${Math.round(mx*k/4)}</text></g>`)}
+ ${[0,1,2,3,4].map(k=>{const i=Math.round(k*(n-1)/4);return html`<text key=${k} x=${X(i)} y=${h-6} text-anchor="middle" font-size="11" fill="var(--mu)">${dates[i].slice(5)}</text>`})}
+ ${split!=null&&html`<line x1=${X(split)} x2=${X(split)} y1=${p.t} y2=${h-p.b} stroke="var(--mu)" stroke-dasharray="4 4"/>`}
+ ${band&&html`<polygon points=${poly} fill="var(--sky)" opacity=".18"/>`}
+ ${series.map(s=>html`<path key=${s.name} d=${pth(s)} fill="none" stroke=${s.c} stroke-width="2" stroke-dasharray=${s.dash||''}/>`)}
+ ${hv!=null&&html`<line x1=${X(hv)} x2=${X(hv)} y1=${p.t} y2=${h-p.b} stroke="var(--mu)" opacity=".5"/>`}</svg>
+ <div class="flex gap-4 text-xs mu flex-wrap">${series.map(s=>html`<span key=${s.name}><span style=${{color:s.c}}>●</span> ${s.name}</span>`)}${split!=null&&html`<span>┆ right of line = forecast</span>`}</div></div>`}
+const Bars=({rows,a,b,la,lb})=>{const mx=Math.max(1,...rows.flatMap(r=>[r[a]||0,r[b]||0]));
+ return html`<div class="space-y-3">${rows.map(r=>html`<div key=${r.name}><div class="text-sm flex justify-between"><span>${r.name}</span><span class="mu">${la} ${r[a]??'—'} · ${lb} ${r[b]}</span></div>
+ <div style=${{height:8,background:'color-mix(in srgb,var(--pri) 12%,transparent)',borderRadius:4,marginTop:3}}><div style=${{height:8,width:(r[a]||0)/mx*100+'%',background:'var(--pri)',borderRadius:4}}/></div>
+ <div style=${{height:8,background:'color-mix(in srgb,var(--sky) 12%,transparent)',borderRadius:4,marginTop:3}}><div style=${{height:8,width:r[b]/mx*100+'%',background:r[b]>(r[a]??1e9)?'var(--red)':'var(--sky)',borderRadius:4}}/></div></div>`)}</div>`};
+const Num=({l,v,set,step=1,min=1,max=99})=>html`<label class="text-sm mu flex items-center gap-2">${l}<input type="number" value=${v} step=${step} min=${min} max=${max} style=${{width:80}} onChange=${e=>set(+e.target.value||v)}/></label>`;
+const Sel=({v,set,o})=>html`<select value=${v} onChange=${e=>set(e.target.value)}>${o.map(x=>html`<option key=${x[0]} value=${x[0]}>${x[1]}</option>`)}</select>`;
+
+const tot=(M,k)=>sum(M.depts.map(d=>d[k])),DAY=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const QA={
+'Which department has the biggest bed shortage?':M=>{const L=[...M.depts].sort((a,b)=>b.shortBeds-a.shortBeds),d=L[0];return d.shortBeds?`${d.name}: ${d.beds} beds available vs ${d.reqBeds} needed at the forecast peak, a gap of ${d.shortBeds}. Other gaps: ${L.slice(1).filter(x=>x.shortBeds).map(x=>x.name+' ('+x.shortBeds+')').join(', ')||'none'}. Total gap: ${tot(M,'shortBeds')} beds.`:'No department has a bed shortage under the current assumptions.'},
+'Will we run out of beds in the next 30 days?':M=>{const L=M.depts.map(d=>({d,i:d.fo.findIndex(v=>v>d.beds)})).filter(x=>x.i>=0);return L.length?'Yes. Forecast occupancy exceeds capacity in: '+L.map(x=>`${x.d.name} (from ${x.d.fd[x.i]})`).join(', ')+'.':'No department is forecast to exceed capacity. Above 90% at peak: '+(M.depts.filter(d=>Math.max(...d.fo)>d.beds*.9).map(d=>d.name).join(', ')||'none')+'.'},
+'How many doctors and nurses do we need to add?':M=>{const f=k=>M.depts.filter(d=>d[k]).map(d=>`${d.name} +${d[k]}`).join(', ')||'none';return `Doctors short by ${tot(M,'docShort')} (${f('docShort')}). Nurses short by ${tot(M,'nurShort')} (${f('nurShort')}). Based on forecast peak occupied beds and the patients-per-clinician ratios on the Staff tab.`},
+'What is the predicted admission demand next month?':M=>{const n=sum(M.depts.map(d=>sum(d.fa))),p=sum(M.depts.map(d=>sum(d.adm.slice(-30))));return `About ${Math.round(n)} admissions over the next 30 days (${((n/p-1)*100).toFixed(1)}% vs the last 30 days). Largest: ${[...M.depts].sort((a,b)=>sum(b.fa)-sum(a.fa)).slice(0,3).map(d=>d.name+' '+Math.round(sum(d.fa))).join(', ')}.`},
+'Which weekday is busiest for admissions?':M=>{const t=Array(7).fill(0),c=Array(7).fill(0);M.depts.forEach(d=>d.adm.slice(-56).forEach((v,i)=>{const k=dowOf(d.dates[d.dates.length-Math.min(56,d.adm.length)+i]);t[k]+=v;c[k]++}));const a=t.map((v,k)=>[k,v/(c[k]/M.depts.length||1)]).sort((x,y)=>y[1]-x[1]);return `${DAY[a[0][0]]} is busiest (about ${Math.round(a[0][1])} admissions/day across all departments); ${DAY[a[6][0]]} is quietest (about ${Math.round(a[6][1])}). Based on the last 8 weeks.`},
+'Which department is most crowded right now?':M=>{const L=[...M.depts].sort((a,b)=>b.occ.at(-1)/b.beds-a.occ.at(-1)/a.beds);return L.slice(0,3).map(d=>`${d.name} ${Math.round(d.occ.at(-1)/d.beds*100)}% (${d.occ.at(-1)}/${d.beds})`).join(', ')+' (latest day in the data).'},
+'How accurate is the forecast?':M=>M.mape==null?'There is not enough history (90+ days) to run the accuracy check.':`When the model was trained without the last 30 days, it missed total daily admissions by about ${M.mape.toFixed(1)}% on average. Treat forecasts as planning estimates; the shaded ranges show likely variation.`,
+'What should we do first?':(M,R)=>R.slice(0,4).map(x=>'• '+x).join('\n')
+},QL=Object.keys(QA),KW=[/shortage|short of|more beds|bed gap/,/run out|exceed|full|capacity|over 90/,/doctor|nurse|hire|staff/,/admission|demand|next month|how many patients/,/day|week/,/crowd|current|right now|occupan/,/accura|error|reliab|trust/,/recommend|action|first|should|prior/];
+function ctxOf(M,P,src,demo){return JSON.stringify({source:demo?'DEMO synthetic data':src,assumptions:{target_occupancy:P.target,patients_per_doctor:P.pd,patients_per_nurse:P.pn},backtest_error_pct:M.mape&&+M.mape.toFixed(1),last_data_date:M.depts[0].dates.at(-1),forecast_window:[M.depts[0].fd[0],M.depts[0].fd.at(-1)],departments:M.depts.map(d=>({name:d.name,beds:d.beds,occupied_now:d.occ.at(-1),avg_daily_admissions_last30:+avg(d.adm.slice(-30)).toFixed(1),forecast_admissions_30d:Math.round(sum(d.fa)),forecast_peak_occupied_beds:Math.round(Math.max(...d.fo)),peak_date:d.fd[d.fo.indexOf(Math.max(...d.fo))],avg_length_of_stay_days:+d.alos.toFixed(1),required_beds:d.reqBeds,bed_shortage:d.shortBeds,doctors_available:d.docAv,doctors_required:d.docReq,nurses_available:d.nurAv,nurses_required:d.nurReq}))})}
+function Chat({M,P,demo,src}){
+ const [ms,setMs]=useState([{r:'b',t:'Hi! Ask about beds, staff, admissions or forecast accuracy in the loaded data. Tap a suggested question or type your own.'}]),[q,setQ]=useState(''),[busy,setBusy]=useState(false),ref=React.useRef(),{R}=insights(M,P);
+ React.useEffect(()=>{ref.current&&(ref.current.scrollTop=ref.current.scrollHeight)},[ms,busy]);
+ const ask=async(text,pre)=>{text=text.trim();if(!text||busy)return;setQ('');const hist=ms.slice(-6).map(m=>(m.r==='u'?'User: ':'Assistant: ')+m.t).join('\n');setMs(m=>[...m,{r:'u',t:text}]);
+  if(pre&&QA[text]){setMs(m=>[...m,{r:'b',t:QA[text](M,R),tag:'Calculated from the data'}]);return}
+  setBusy(true);let out=null;
+  try{const s=window.claude&&await window.claude.use('sample');if(s){const res=await s('You are a hospital capacity-planning assistant inside a dashboard. Answer ONLY from the JSON summary below (department-level aggregates; no patient records exist). If the summary cannot answer, say what is missing. Be concise (under 120 words), use plain numbers, give no clinical or treatment advice, and mention if the data is demo/synthetic when relevant.\n\nSUMMARY:\n'+ctxOf(M,P,src,demo)+'\n\nCONVERSATION SO FAR:\n'+hist+'\n\nUser question: '+text,{modelTier:'quick',cache:false});out={t:res.text,tag:'AI answer from the forecast summary'}}}catch(e){}
+  if(!out){const i=KW.findIndex(k=>k.test(text.toLowerCase()));out=i>=0?{t:QA[QL[i]](M,R),tag:'Calculated from the data'}:{t:'AI answers are unavailable here, and I could not match that question. Try one of the suggested questions.'}}
+  setMs(m=>[...m,{r:'b',...out}]);setBusy(false)};
+ return html`<div class="space-y-3"><div class="card"><div ref=${ref} class="space-y-3" style=${{maxHeight:380,minHeight:180,overflowY:'auto'}}>${ms.map((m,i)=>html`<div key=${i} style=${{display:'flex',justifyContent:m.r==='u'?'flex-end':'flex-start'}}><div style=${{maxWidth:'85%',padding:'8px 12px',borderRadius:12,whiteSpace:'pre-wrap',fontSize:14,background:m.r==='u'?'var(--pri)':'color-mix(in srgb,var(--pri) 10%,transparent)',color:m.r==='u'?'#fff':'var(--tx)'}}>${m.t}${m.tag&&html`<div class="text-xs mt-1" style=${{opacity:.7}}>${m.tag}</div>`}</div></div>`)}${busy&&html`<div class="mu text-sm">Thinking…</div>`}</div>
+  <div class="flex gap-2 mt-3"><input value=${q} placeholder="Ask a question about the data…" onInput=${e=>setQ(e.target.value)} onKeyDown=${e=>e.key==='Enter'&&ask(q)} style=${{flex:1,minWidth:0,background:'var(--card)',color:'var(--tx)',border:'1px solid var(--bd)',borderRadius:10,padding:'8px 10px',fontSize:14}}/><button class="btn" disabled=${busy} onClick=${()=>ask(q)}>Send</button></div></div>
+  <div class="card"><div class="mu text-sm mb-2">Suggested questions</div><div class="flex flex-wrap gap-2">${QL.map(k=>html`<button key=${k} class="btn alt" style=${{fontSize:13}} onClick=${()=>ask(k,1)}>${k}</button>`)}</div></div>
+  <div class="mu text-xs">Suggested questions are calculated directly from your data. Typed questions are answered by Claude using only a department-level summary of the numbers shown on this dashboard (never uploaded rows, names or IDs), and you will be asked for permission first. ${demo?'Current data is synthetic demo data.':''}</div></div>`}
+function App(){
+ const T=['Overview','Bed Management','Staff Management','AI Predictions','Data Upload','Reports','Ask the Data'];
+ const [tab,setTab]=useState(0),[data,setData]=useState(sampleData),[P,setP]=useState({target:.85,pd:8,pn:4}),[dept,setDept]=useState('All'),[rng,setRng]=useState(90),[metric,setMetric]=useState('occ'),[msg,setMsg]=useState(null);
+ const M=useMemo(()=>run(data,P),[data,P]),names=M.depts.map(d=>d.name),ds=names.includes(dept)?dept:'All';
+ const sel=useMemo(()=>agg(M.depts.filter(d=>ds==='All'||d.name===ds)),[M,ds]),{A,R}=useMemo(()=>insights(M,P),[M,P]),demo=data.source==='demo',n=sel.occ.length,r=Math.min(rng,n);
+ const cur=sel.occ[n-1],adm30=sum(sel.fa),prev30=sum(sel.adm.slice(-30)),dl=prev30?(adm30/prev30-1)*100:0,peak=Math.max(...sel.fo),shorts=sel.docShort+sel.nurShort;
+ const filt=html`<div class="flex gap-3 flex-wrap items-center"><${Sel} v=${ds} set=${setDept} o=${[['All','All departments'],...names.map(x=>[x,x])]}/></div>`;
+ const occChart=(h,title)=>html`<${Chart} title=${title} h=${h} dates=${sel.dates.slice(-r).concat(sel.fd)} split=${r} band=${{o:r,hi:sel.hi,lo:sel.lo}} series=${[{name:'Occupied beds',v:sel.occ.slice(-r),o:0,c:'var(--pri)'},{name:'Forecast',v:sel.fo,o:r,c:'var(--sky)',dash:'5 3'},{name:'Bed capacity',v:Array(r+30).fill(sel.beds),o:0,c:'var(--red)',dash:'2 3'}]}/>`;
+ const pc=P=>Math.round(P*100)+'%';
+ const csv=()=>['data_source,department,date,predicted_admissions,predicted_occupied_beds,occupied_low,occupied_high',...M.depts.flatMap(d=>d.fd.map((x,i)=>[demo?'DEMO (synthetic)':'uploaded',d.name,x,d.fa[i].toFixed(1),d.fo[i].toFixed(1),d.lo[i].toFixed(1),d.hi[i].toFixed(1)].join(',')))].join('\n');
+ const txt=()=>`HOSPITAL RESOURCE FORECAST - next 30 days${demo?'\n*** DEMO / SYNTHETIC DATA - NOT REAL PATIENTS ***':''}\nAssumptions: target occupancy ${pc(P.target)}, ${P.pd} patients/doctor, ${P.pn} patients/nurse. Forecasts are statistical estimates; clinical leaders should review before acting.\n\nALERTS\n${A.map(a=>'- ['+a.s.toUpperCase()+'] '+a.t).join('\n')||'- none'}\n\nRECOMMENDATIONS\n${R.map(x=>'- '+x).join('\n')}\n`;
+ const up=async f=>{if(!f)return;try{const o=ingest(await readFile(f));setData(d=>o.daily?{daily:o.daily,caps:o.caps,source:f.name}:{...d,caps:{...d.caps,...o.caps}});setMsg({ok:1,t:`Loaded ${f.name}.`+(o.ignored.length?` Ignored identifying columns: ${o.ignored.join(', ')}.`:'')})}catch(e){setMsg({t:String(e.message||e)})}};
+ const fmt=v=>v==null?'—':v;
+ return html`<div>
+ <header class="hd"><div class="max-w-6xl mx-auto px-4 pt-4 pb-3"><div class="flex items-center justify-between flex-wrap gap-2"><div><div class="text-xl font-bold">🏥 Hospital Resource Prediction</div><div class="text-xs opacity-80">Admissions · beds · doctors · nurses · next 30 days</div></div><span class="text-xs px-2 py-1 rounded" style=${{background:'rgba(255,255,255,.18)'}}>${demo?'DEMO DATA':'Data: '+data.source}</span></div>
+ <nav class="flex gap-1 mt-3 overflow-x-auto sc">${T.map((t,i)=>html`<button key=${t} class=${'tab '+(tab===i?'on':'')} onClick=${()=>setTab(i)}>${t}</button>`)}</nav></div></header>
+ <main class="max-w-6xl mx-auto px-4 py-5 space-y-4">
+ ${demo&&html`<div class="card text-sm" style=${{borderColor:'var(--amb)'}}><b style=${{color:'var(--amb)'}}>Demo results.</b> The numbers below come from synthetic, computer-generated data (no real patients). Upload your own file in <a href="#" class="underline" onClick=${e=>{e.preventDefault();setTab(4)}}>Data Upload</a> to get real predictions.</div>`}
+ ${tab<4&&tab!==2&&filt}${tab===2&&filt}
+ ${tab===0&&html`<div class="space-y-4"><div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+  <${Kpi} l="Current inpatients" v=${Math.round(cur)} s=${'last day of data, '+sel.dates[n-1]}/>
+  <${Kpi} l="Bed occupancy" v=${pc(cur/sel.beds)} s=${sel.beds+' beds total'} c=${cur/sel.beds>.9?'red':null}/>
+  <${Kpi} l="Predicted admissions" v=${Math.round(adm30)} s=${(dl>=0?'+':'')+dl.toFixed(1)+'% vs last 30 days'}/>
+  <${Kpi} l="Predicted peak occupancy" v=${pc(peak/sel.beds)} s=${'peak '+Math.round(peak)+' occupied beds'} c=${peak>sel.beds?'red':peak>sel.beds*.9?'amb':'grn'}/>
+  <${Kpi} l="Staff shortages" v=${shorts} s=${sel.docShort+' doctors · '+sel.nurShort+' nurses'} c=${shorts?'red':'grn'}/></div>
+  <div class="card"><div class="flex justify-end mb-2"><${Sel} v=${rng} set=${v=>setRng(+v)} o=${[[30,'Last 30 days'],[90,'Last 90 days'],[365,'Last year']]}/></div>${occChart(240,'Occupied beds: history and 30-day forecast')}</div>
+  <div class="card"><${Chart} title="Daily admissions" dates=${sel.dates.slice(-r).concat(sel.fd)} split=${r} band=${{o:r,hi:sel.ahi,lo:sel.alo}} series=${[{name:'Admissions',v:sel.adm.slice(-r),o:0,c:'var(--pri)'},{name:'Forecast',v:sel.fa,o:r,c:'var(--sky)',dash:'5 3'}]}/></div>
+  <div class="mu text-xs">Backtest accuracy (model trained without the last 30 days, total daily admissions): ${M.mape==null?'needs 90+ days of data':'average error '+M.mape.toFixed(1)+'%'}.</div></div>`}
+ ${tab===1&&html`<div class="space-y-4"><div class="card flex gap-4 flex-wrap items-center"><${Num} l="Target occupancy %" v=${Math.round(P.target*100)} min=${60} max=${95} set=${v=>setP({...P,target:v/100})}/><span class="mu text-xs">Required beds = forecast peak occupied beds ÷ target occupancy.</span></div>
+  <div class="grid lg:grid-cols-2 gap-4"><div class="card"><b class="text-sm">Available vs required beds</b><div class="mt-3"><${Bars} rows=${M.depts.filter(d=>ds==='All'||d.name===ds)} a="beds" b="reqBeds" la="Available" lb="Required"/></div></div>
+  <div class="card">${occChart(230,'Forecast vs bed capacity')}</div></div>
+  <div class="card sc"><table><thead><tr><th>Department</th><th>Beds</th><th>Occupied now</th><th>Forecast peak</th><th>Required</th><th>Shortage</th></tr></thead><tbody>${M.depts.filter(d=>ds==='All'||d.name===ds).map(d=>html`<tr key=${d.name}><td>${d.name}</td><td>${d.beds}</td><td>${d.occ[n-1]}</td><td>${Math.round(Math.max(...d.fo))}</td><td>${d.reqBeds}</td><td>${d.shortBeds?Badge('−'+d.shortBeds,'red'):Badge('OK','grn')}</td></tr>`)}</tbody></table></div></div>`}
+ ${tab===2&&html`<div class="space-y-4"><div class="card flex gap-4 flex-wrap items-center"><${Num} l="Patients per doctor" v=${P.pd} set=${v=>setP({...P,pd:v})}/><${Num} l="Patients per nurse" v=${P.pn} set=${v=>setP({...P,pn:v})}/><span class="mu text-xs">Editable planning ratios (per clinician on duty). Check them against your hospital's policy.</span></div>
+  <div class="grid lg:grid-cols-2 gap-4"><div class="card"><b class="text-sm">Doctors: available vs required</b><div class="mt-3"><${Bars} rows=${M.depts.filter(d=>ds==='All'||d.name===ds).map(d=>({name:d.name,a:d.docAv,b:d.docReq}))} a="a" b="b" la="Available" lb="Required"/></div></div>
+  <div class="card"><b class="text-sm">Nurses: available vs required</b><div class="mt-3"><${Bars} rows=${M.depts.filter(d=>ds==='All'||d.name===ds).map(d=>({name:d.name,a:d.nurAv,b:d.nurReq}))} a="a" b="b" la="Available" lb="Required"/></div></div></div>
+  <div class="card sc"><table><thead><tr><th>Department</th><th>Doctors avail.</th><th>Doctors req.</th><th>Gap</th><th>Nurses avail.</th><th>Nurses req.</th><th>Gap</th></tr></thead><tbody>${M.depts.filter(d=>ds==='All'||d.name===ds).map(d=>html`<tr key=${d.name}><td>${d.name}</td><td>${fmt(d.docAv)}</td><td>${d.docReq}</td><td>${d.docShort?Badge('−'+d.docShort,'red'):Badge('OK','grn')}</td><td>${fmt(d.nurAv)}</td><td>${d.nurReq}</td><td>${d.nurShort?Badge('−'+d.nurShort,'red'):Badge('OK','grn')}</td></tr>`)}</tbody></table>
+  <div class="mu text-xs mt-2">Available = average on duty over the last 28 days (from uploaded staff data). "—" means no staff data for that department.</div></div></div>`}
+ ${tab===3&&html`<div class="space-y-4"><div class="card"><div class="flex gap-2 mb-2"><${Sel} v=${metric} set=${setMetric} o=${[['occ','Occupied beds'],['adm','Admissions']]}/></div>
+  ${metric==='occ'?occChart(260,'Occupied beds, next 30 days (shaded = ~80% range)'):html`<${Chart} title="Admissions, next 30 days (shaded = ~80% range)" h=${260} dates=${sel.dates.slice(-r).concat(sel.fd)} split=${r} band=${{o:r,hi:sel.ahi,lo:sel.alo}} series=${[{name:'Admissions',v:sel.adm.slice(-r),o:0,c:'var(--pri)'},{name:'Forecast',v:sel.fa,o:r,c:'var(--sky)',dash:'5 3'}]}/>`}</div>
+  <div class="grid lg:grid-cols-2 gap-4"><div class="card"><b class="text-sm">Alerts</b><div class="mt-2 space-y-2">${A.length?A.map((a,i)=>html`<div key=${i} class="text-sm flex gap-2 items-start">${Badge(a.s,a.s==='critical'?'red':'amb')}<span>${a.t}</span></div>`):html`<div class="text-sm mu">No alerts under current assumptions.</div>`}</div></div>
+  <div class="card"><b class="text-sm">How the forecast works</b><p class="text-sm mu mt-2">For each department: (1) day-of-week pattern and an 8-week trend are fitted to daily admissions; (2) average length of stay is estimated from occupancy ÷ admissions (Little's law) and used to roll beds forward; (3) required beds and staff are derived from the forecast peak and your ratios. Ranges come from the model's own historical error. It is a statistical estimate, not a clinical decision.</p></div></div>
+  <div class="card sc" style=${{maxHeight:320,overflowY:'auto'}}><table><thead><tr><th>Date</th><th>Admissions</th><th>Occupied beds</th><th>Range</th><th>Occupancy</th></tr></thead><tbody>${sel.fd.map((d,i)=>html`<tr key=${d}><td>${d}</td><td>${sel.fa[i].toFixed(1)}</td><td>${sel.fo[i].toFixed(1)}</td><td>${Math.round(sel.lo[i])}–${Math.round(sel.hi[i])}</td><td>${pc(sel.fo[i]/sel.beds)}</td></tr>`)}</tbody></table></div></div>`}
+ ${tab===4&&html`<div class="space-y-4"><div class="card"><b>Upload hospital data (CSV or Excel)</b>
+  <div class="mt-3"><input type="file" accept=".csv,.xlsx,.xls" onChange=${e=>up(e.target.files[0])}/></div>
+  ${msg&&html`<div class="text-sm mt-3" style=${{color:msg.ok?'var(--grn)':'var(--red)'}}>${msg.t}</div>`}
+  <div class="flex gap-2 mt-3 flex-wrap"><button class="btn alt" onClick=${()=>{setData(sampleData());setMsg(null)}}>Reset to demo data</button><button class="btn alt" onClick=${()=>save('sample_daily_template.csv',['date,department,admissions,discharges,occupied_beds,total_beds,doctors,nurses',...data.daily.slice(-300).map(r=>[r.date,r.dept,r.adm,r.dis,r.occ,r.beds||'',r.docs||'',r.nurses||''].join(','))].join('\n'),'text/csv')}>Download example file</button></div></div>
+  <div class="card text-sm space-y-2"><b>Accepted formats (first sheet, header row required, dates as YYYY-MM-DD or DD/MM/YYYY)</b>
+  <p><b>1. Patient-level:</b> <code>admission_date, discharge_date, department</code> (optional <code>diagnosis</code>). Counts per day are computed in your browser; occupancy is derived from stay dates.</p>
+  <p><b>2. Daily summary:</b> <code>date, department, admissions, discharges, occupied_beds</code> plus optional <code>total_beds, doctors, nurses</code>.</p>
+  <p><b>3. Staff / capacity file:</b> <code>department, total_beds, doctors, nurses</code> (doctors and nurses on duty). Upload after 1 or 2.</p>
+  <p class="mu">Need at least ~8 weeks of history (90+ days enables the accuracy check).</p></div>
+  <div class="card text-sm" style=${{borderColor:'var(--grn)'}}><b style=${{color:'var(--grn)'}}>Privacy</b><p class="mt-1 mu">Files are read and processed only inside this browser tab; they are not uploaded or stored. Only dates, departments and counts are used. Columns such as names, patient IDs, phone, address, date of birth are never read and are reported as ignored. Please upload de-identified data and follow your hospital's data-protection policy.</p></div></div>`}
+ ${tab===5&&html`<div class="space-y-4"><div class="card"><b>Download</b><div class="flex gap-2 mt-3 flex-wrap"><button class="btn" onClick=${()=>save('predictions_30_days.csv',csv(),'text/csv')}>Predictions (CSV)</button><button class="btn" onClick=${()=>save('recommendations.txt',txt(),'text/plain')}>Alerts and recommendations (TXT)</button></div>${demo&&html`<div class="text-xs mt-2" style=${{color:'var(--amb)'}}>Reports from demo data are labelled as synthetic.</div>`}</div>
+  <div class="card"><b>Recommendations</b><ul class="mt-2 text-sm space-y-1 list-disc pl-5">${R.map((x,i)=>html`<li key=${i}>${x}</li>`)}</ul></div></div>`}
+ <div style=${{display:tab===6?'block':'none'}}><${Chat} M=${M} P=${P} demo=${demo} src=${data.source}/></div>
+ <footer class="mu text-xs pt-2">Forecasts are statistical estimates for planning support and need clinical and operational review. All calculations run in your browser.</footer></main></div>`}
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script></body></html>
